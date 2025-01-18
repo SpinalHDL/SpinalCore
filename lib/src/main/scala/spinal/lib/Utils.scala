@@ -23,6 +23,7 @@ import spinal.core.internals._
 import java.io.UTFDataFormatException
 import java.nio.charset.Charset
 import spinal.core._
+import spinal.core.formal.HasFormalAsserts
 import spinal.lib.bus.misc.AddressTransformer
 import spinal.lib.misc.PathTracer
 
@@ -597,7 +598,7 @@ object Counter {
 }
 
 // start and end inclusive, up counter
-class Counter(val start: BigInt,val end: BigInt) extends ImplicitArea[UInt] {
+class Counter(val start: BigInt,val end: BigInt) extends ImplicitArea[UInt] with HasFormalAsserts {
   require(start <= end)
   val willIncrement = False.allowOverride
   val willClear = False.allowOverride
@@ -644,6 +645,11 @@ class Counter(val start: BigInt,val end: BigInt) extends ImplicitArea[UInt] {
     value.removeInitAssignments()
     value.init(initValue)
     this
+  }
+
+  override def formalChecks()(implicit useAssumes: Boolean) = {
+    assertOrAssume(value >= start)
+    assertOrAssume(value <= end)
   }
 }
 
@@ -726,7 +732,7 @@ object CounterUpDown {
   //  implicit def implicitValue(c: Counter) = c.value
 }
 
-class CounterUpDown(val stateCount: BigInt, val handleOverflow : Boolean = true) extends ImplicitArea[UInt] {
+class CounterUpDown(val stateCount: BigInt, val handleOverflow : Boolean = true) extends ImplicitArea[UInt] with HasFormalAsserts {
   val incrementIt = False
   val decrementIt = False
 
@@ -772,6 +778,10 @@ class CounterUpDown(val stateCount: BigInt, val handleOverflow : Boolean = true)
   }
   
   override def implicitValue: UInt = this.value
+
+  override def formalChecks()(implicit useAssumes: Boolean) = {
+    assertOrAssume(value <= stateCount - 1)
+  }
 }
 
 

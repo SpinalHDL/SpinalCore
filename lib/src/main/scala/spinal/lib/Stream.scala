@@ -1,6 +1,7 @@
 package spinal.lib
 
 import spinal.core._
+import spinal.core.formal.HasFormalAsserts
 import spinal.idslplugin.Location
 import spinal.lib.eda.bench.{AlteraStdTargets, Bench, EfinixStdTargets, Rtl, XilinxStdTargets}
 
@@ -555,6 +556,30 @@ class Stream[T <: Data](val payloadType :  HardType[T]) extends Bundle with IMas
     }
   }
 
+  def formalIsValid(payloadInvariance : Boolean = true) = new Composite(this, "formalIsValid") {
+    import spinal.core.formal._
+    val wasStall = past(isStall) init(False)
+    val checkValidHandshake = Mux(wasStall, valid, True)
+
+    val priorValidPayload = RegNextWhen(payload, valid)
+    val checkValidPayloadInvariance = Mux(wasStall && Bool(payloadInvariance),
+      priorValidPayload === payload,
+      True)
+
+    val isValid = checkValidHandshake && checkValidPayloadInvariance
+  }.isValid
+
+  def formalAsserts(payloadInvariance : Boolean = true)(implicit loc : Location, useAssumes : Boolean = false) = new Composite(this, if(useAssumes) "assumes" else "asserts") {
+    import spinal.core.formal._
+    import spinal.core.formal.HasFormalAsserts._
+
+    val stack = ScalaLocated.long
+    when(past(isStall) init(False)) {
+      assertOrAssume(valid,  "Stream transaction disappeared:\n" + stack)
+      if(payloadInvariance) assertOrAssume( RegNextWhen(payload, valid) === payload, "Stream transaction payload changed:\n" + stack)
+    }
+  }
+
   /**
    * Assert that this stream conforms to the stream semantics:
    * https://spinalhdl.github.io/SpinalDoc-RTD/dev/SpinalHDL/Libraries/stream.html#semantics
@@ -562,22 +587,12 @@ class Stream[T <: Data](val payloadType :  HardType[T]) extends Bundle with IMas
    *
    * @param payloadInvariance Check that the payload does not change when valid is high and ready is low.
    */
-  def formalAssertsMaster(payloadInvariance : Boolean = true)(implicit loc : Location) = new Composite(this, "asserts") {
-    import spinal.core.formal._
-    val stack = ScalaLocated.long
-    when(past(isStall) init(False)) {
-      assert(valid,  "Stream transaction disappeared:\n" + stack)
-      if(payloadInvariance) assert(stable(payload), "Stream transaction payload changed:\n" + stack)
-    }
-  }
+  def formalAssertsMaster(payloadInvariance : Boolean = true)(implicit loc : Location) =
+    formalAsserts(payloadInvariance)(loc = loc, useAssumes = false)
 
-  def formalAssumesSlave(payloadInvariance : Boolean = true)(implicit loc : Location) = new Composite(this, "assumes") {
-    import spinal.core.formal._
-    when(past(isStall) init (False)) {
-      assume(valid)
-      if(payloadInvariance) assume(stable(payload))
-    }
-  }
+  def formalAssumesSlave(payloadInvariance : Boolean = true)(implicit loc : Location) =
+    formalAsserts(payloadInvariance)(loc = loc, useAssumes = true)
+
 
   def formalCovers(back2BackCycles: Int = 1) = new Composite(this, "covers") {
     import spinal.core.formal._
@@ -670,13 +685,16 @@ object StreamArbiter {
       maskProposal(counter) := True
     }
 
-    def roundRobin(core: StreamArbiter[_ <: Data]) = new Area {
+    def roundRobin(core: StreamArbiter[_ <: Data]) = new Area with HasFormalAsserts {
       import core._
       for(bitId  <- maskLocked.range){
         maskLocked(bitId) init(Bool(bitId == maskLocked.length-1))
       }
+
       //maskProposal := maskLocked
       maskProposal := OHMasking.roundRobin(Vec(io.inputs.map(_.valid)),Vec(maskLocked.last +: maskLocked.take(maskLocked.length-1)))
+
+      override def formalChecks()(implicit useAssumes: Boolean) = assertOrAssume(CountOne(maskLocked) <= 1)
     }
   }
 
@@ -716,7 +734,7 @@ object StreamArbiter {
  *  A StreamArbiter is like a StreamMux, but with built-in complex selection logic that can arbitrate input
  *  streams based on a schedule or handle fragmented streams. Use a StreamArbiterFactory to create instances of this class.
  */
-class StreamArbiter[T <: Data](dataType: HardType[T], val portCount: Int)(val arbitrationFactory: (StreamArbiter[T]) => Area, val lockFactory: (StreamArbiter[T]) => Area) extends Component {
+class StreamArbiter[T <: Data](dataType: HardType[T], val portCount: Int)(val arbitrationFactory: (StreamArbiter[T]) => Area, val lockFactory: (StreamArbiter[T]) => Area) extends Component with HasFormalAsserts {
   val io = new Bundle {
     val inputs = Vec(slave Stream (dataType),portCount)
     val output = master Stream (dataType)
@@ -729,7 +747,6 @@ class StreamArbiter[T <: Data](dataType: HardType[T], val portCount: Int)(val ar
   val maskProposal = Vec(Bool(),portCount)
   val maskLocked = Reg(Vec(Bool(),portCount))
   val maskRouted = Mux(locked, maskLocked, maskProposal)
-
 
   when(io.output.valid) {
     maskLocked := maskRouted
@@ -744,6 +761,14 @@ class StreamArbiter[T <: Data](dataType: HardType[T], val portCount: Int)(val ar
 
   io.chosenOH := maskRouted.asBits
   io.chosen := OHToUInt(io.chosenOH)
+
+  override def formalChecks()(implicit useAssumes: Boolean) = {
+    assertOrAssume(CountOne(maskRouted) <= 1)
+    io.output.formalAsserts(payloadInvariance = !locked.dlcHasOnlyOne)
+  }
+
+  override lazy val formalValidInputs = io.inputs.map(_.formalIsValid()).andR
+
 }
 
 class StreamArbiterFactory {
@@ -1071,15 +1096,18 @@ object StreamFork3 {
  *  other way around. It also violates the handshake of the AXI specification (section A3.3.1).
  */
 //TODOTEST
-class StreamFork[T <: Data](dataType: HardType[T], portCount: Int, synchronous: Boolean = false) extends Component {
+class StreamFork[T <: Data](dataType: HardType[T], portCount: Int, synchronous: Boolean = false) extends Component with HasFormalAsserts {
   val io = new Bundle {
     val input = slave Stream (dataType)
     val outputs = Vec(master Stream (dataType), portCount)
   }
   val logic = new StreamForkArea(io.input, io.outputs, synchronous)
+
+  override lazy val formalValidInputs = logic.formalValidInputs
+  override def formalChecks()(implicit useAssumes: Boolean) = logic.formalChecks()
 }
 
-class StreamForkArea[T <: Data](input : Stream[T], outputs : Seq[Stream[T]], synchronous: Boolean = false) extends Area {
+class StreamForkArea[T <: Data](input : Stream[T], outputs : Seq[Stream[T]], synchronous: Boolean = false) extends Area with HasFormalAsserts {
   val portCount = outputs.size
   /*Used for async, Store if an output stream already has taken its value or not */
   val linkEnable = if(!synchronous)Vec(RegInit(True),portCount)else null
@@ -1111,6 +1139,15 @@ class StreamForkArea[T <: Data](input : Stream[T], outputs : Seq[Stream[T]], syn
       linkEnable.foreach(_ := True)
     }
   }
+
+  override def formalChecks()(implicit useAssumes: Boolean) = new Area {
+    if(linkEnable != null) {
+        assertOrAssume(input.valid || linkEnable.asBits.andR, "Link enable must be true when input is invalid.")
+    }
+    outputs.foreach(_.formalAsserts())
+  }
+
+  override lazy val formalValidInputs = input.formalIsValid()
 }
 
 
@@ -1217,7 +1254,7 @@ class StreamFifo[T <: Data](val dataType: HardType[T],
                             val withBypass : Boolean = false,
                             val allowExtraMsb : Boolean = true,
                             val forFMax : Boolean = false,
-                            val useVec : Boolean = false) extends Component {
+                            val useVec : Boolean = false) extends Component with HasFormalAsserts {
   require(depth >= 0)
 
   if(withBypass) require(withAsyncRead)
@@ -1403,45 +1440,133 @@ class StreamFifo[T <: Data](val dataType: HardType[T],
     }
   }
 
+  override lazy val formalValidInputs = io.push.formalIsValid()
 
+  override def formalChecks()(implicit useAssumes : Boolean = false) = new Composite(this, FormalCompositeName) {
+    val logic_option = Option(logic)
+
+    // Occupancy as dictated soley by push/pop pointers
+    val push_pop_occupancy =
+      logic_option.map(logic => {
+        val push_sub_pop = logic.ptr.push -^ logic.ptr.pop
+        if (withExtraMsb)
+          Mux(logic.ptr.push >= logic.ptr.pop,
+            push_sub_pop,
+            (depth << 1) -^ logic.ptr.pop +^ logic.ptr.push
+          )
+        else
+          Mux(logic.ptr.push === logic.ptr.pop,
+            Mux(logic.ptr.wentUp, U(depth), U(0)),
+            Mux(logic.ptr.push > logic.ptr.pop,
+              push_sub_pop,
+              depth -^ logic.ptr.pop +^ logic.ptr.push
+            )
+          )
+      }).getOrElse(U(0))
+
+    val extraOccupancy = logic_option.flatMap(logic => Option(logic.pop.sync)).map(_.readArbitation.valid.asUInt).getOrElse(U(0))
+
+    val calculate_occupancy = push_pop_occupancy +^ extraOccupancy
+
+    // Fifo depth of 0 is just a direct connect
+    // Fifo depth of 1 is just a staged stream; so it can't be in an invalid state
+    if (depth > 1) {
+      assertOrAssume(calculate_occupancy === io.occupancy)
+      assertOrAssume(io.availability === depth -^ io.occupancy)
+
+      when(io.occupancy === 0) {
+        assertOrAssume(io.pop.valid === (io.push.fire && Bool(withBypass)), "Occupancy check didn't result in right pop valid")
+      }
+
+      if (logic != null) {
+        when(logic.ptr.pop === 0 && Bool(!isPow2(depth))) {
+          assertOrAssume(logic.ptr.popOnIo === ((depth - extraOccupancy) % depth))
+        } otherwise {
+          assertOrAssume(logic.ptr.popOnIo === (logic.ptr.pop - extraOccupancy))
+        }
+
+        when(io.availability === 0) {
+          assertOrAssume(io.push.ready === False)
+        }
+
+        if (!withExtraMsb) {
+          assertOrAssume(logic.ptr.pop <= (depth - 1))
+          assertOrAssume(logic.ptr.push <= (depth - 1))
+        } else {
+          assertOrAssume(logic.ptr.pop <= ((depth << 1) - 1))
+          assertOrAssume(logic.ptr.push <= ((depth << 1) - 1))
+        }
+
+        if (forFMax) {
+          val counterWidth = log2Up(depth) + 1
+          val emptyStart = 1 << (counterWidth - 1)
+          val fullStart = (1 << (counterWidth - 1)) - depth
+
+          assertOrAssume(logic.ptr.arb.fmax.fullTracker.value === (fullStart +^ io.occupancy))
+          assertOrAssume(logic.ptr.arb.fmax.emptyTracker.value === (emptyStart -^ push_pop_occupancy))
+        }
+      }
+    }
+
+    // Output should always be valid
+    io.pop.formalAsserts()
+  }
+
+  def formalCheckLastPush(cond: T => Bool) : Bool = new Composite(this) {
+    val lastPush = if(logic != null) {
+      val condition = (0 until depth).map(x => cond(if (useVec) logic.vec(x) else logic.ram(x)))
+      val lastPushIdx = (logic.ptr.push +^ depth -^ 1) % depth
+      condition(lastPushIdx.resized)
+    } else if (oneStage != null) {
+      cond(oneStage.buffer.payload)
+    } else {
+      cond(io.push.payload)
+    }
+  }.lastPush
 
   // check a condition against all valid payloads in the FIFO RAM
   def formalCheckRam(cond: T => Bool): Vec[Bool] = new Composite(this){
-    val condition = (0 until depth).map(x => cond(if (useVec) logic.vec(x) else logic.ram(x)))
-    // create mask for all valid payloads in FIFO RAM
-    // inclusive [popd_idx, push_idx) exclusive
-    // assume FIFO RAM is full with valid payloads
-    //           [ ...  push_idx ... ]
-    //           [ ...  pop_idx  ... ]
-    // mask      [ 1 1 1 1 1 1 1 1 1 ]
-    val mask = Vec(True, depth)
-    val push_idx = logic.ptr.push.resize(log2Up(depth))
-    val pop_idx = logic.ptr.pop.resize(log2Up(depth))
-    // pushMask(i)==0 indicates location i was popped
-    val popMask = (~((U(1) << pop_idx) - 1)).asBits
-    // pushMask(i)==1 indicates location i was pushed
-    val pushMask = ((U(1) << push_idx) - 1).asBits
-    // no wrap   [ ... popd_idx ... push_idx ... ]
-    // popMask   [ 0 0 1 1 1 1  1 1 1 1 1 1 1 1 1]
-    // pushpMask [ 1 1 1 1 1 1  1 1 0 0 0 0 0 0 0] &
-    // mask      [ 0 0 1 1 1 1  1 1 0 0 0 0 0 0 0]
-    when(pop_idx < push_idx) {
-      mask.assignFromBits(pushMask & popMask)
-      // wrapped   [ ... push_idx ... popd_idx ... ]
-      // popMask   [ 0 0 0 0 0 0  0 0 1 1 1 1 1 1 1]
-      // pushpMask [ 1 1 0 0 0 0  0 0 0 0 0 0 0 0 0] |
-      // mask      [ 1 1 0 0 0 0  0 0 1 1 1 1 1 1 1]
-    }.elsewhen(pop_idx > push_idx) {
-      mask.assignFromBits(pushMask | popMask)
-      // empty?
+    val vec = if(logic != null) {
+      val condition = (0 until depth).map(x => cond(if (useVec) logic.vec(x) else logic.ram(x)))
+      // create mask for all valid payloads in FIFO RAM
+      // inclusive [popd_idx, push_idx) exclusive
+      // assume FIFO RAM is full with valid payloads
       //           [ ...  push_idx ... ]
       //           [ ...  pop_idx  ... ]
-      // mask      [ 0 0 0 0 0 0 0 0 0 ]
-    }.elsewhen(logic.ptr.empty) {
-      mask := mask.getZero
+      // mask      [ 1 1 1 1 1 1 1 1 1 ]
+      val mask = Vec(True, depth)
+      val push_idx = logic.ptr.push.resize(log2Up(depth))
+      val pop_idx = logic.ptr.pop.resize(log2Up(depth))
+      // pushMask(i)==0 indicates location i was popped
+      val popMask = (~((U(1) << pop_idx) - 1)).asBits
+      // pushMask(i)==1 indicates location i was pushed
+      val pushMask = ((U(1) << push_idx) - 1).asBits
+      // no wrap   [ ... popd_idx ... push_idx ... ]
+      // popMask   [ 0 0 1 1 1 1  1 1 1 1 1 1 1 1 1]
+      // pushpMask [ 1 1 1 1 1 1  1 1 0 0 0 0 0 0 0] &
+      // mask      [ 0 0 1 1 1 1  1 1 0 0 0 0 0 0 0]
+      when(pop_idx < push_idx) {
+        mask.assignFromBits(pushMask & popMask)
+        // wrapped   [ ... push_idx ... popd_idx ... ]
+        // popMask   [ 0 0 0 0 0 0  0 0 1 1 1 1 1 1 1]
+        // pushpMask [ 1 1 0 0 0 0  0 0 0 0 0 0 0 0 0] |
+        // mask      [ 1 1 0 0 0 0  0 0 1 1 1 1 1 1 1]
+      }.elsewhen(pop_idx > push_idx) {
+        mask.assignFromBits(pushMask | popMask)
+        // empty?
+        //           [ ...  push_idx ... ]
+        //           [ ...  pop_idx  ... ]
+        // mask      [ 0 0 0 0 0 0 0 0 0 ]
+      }.elsewhen(logic.ptr.empty) {
+        mask := mask.getZero
+      }
+      val check = mask.zipWithIndex.map { case (x, id) => x & condition(id) }
+      Vec(check)
+    } else if (oneStage != null) {
+      Vec(oneStage.buffer.valid & cond(oneStage.buffer.payload))
+    } else {
+      Vec[Bool](Seq())
     }
-    val check = mask.zipWithIndex.map{case (x, id) => x & condition(id)}
-    val vec = Vec(check)
   }.vec
 
   def formalCheckOutputStage(cond: T => Bool): Bool = {
